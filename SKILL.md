@@ -2,11 +2,11 @@
 name: doc-intelligence-pipeline
 description: "Cross-OS .docx scanner: 2GB, cron, knowledge extraction."
 version: 1.1.0
-author: Ahmed + Hermes
+author: Ahmed
 license: MIT
 platforms: [macos, windows, linux]
 prerequisites:
-  commands: [python3, git, bash]
+  commands: [python3, git, bash, pandoc]
   python_packages: [python-docx, tomli]
 metadata:
   hermes:
@@ -38,7 +38,7 @@ Run this on the target machine to see what needs attention before a full install
 # Copy-paste into terminal — detects OS and reports every dependency
 echo "=== DocIntel Quick Health Check ==="
 echo "OS: $(uname -s) $(uname -m)"
-for cmd in python3 python git bash; do
+for cmd in python3 python git bash pandoc; do
   if command -v "$cmd" &>/dev/null; then
     ver=$("$cmd" --version 2>&1 | head -1)
     echo "  [OK]   $cmd — $ver"
@@ -74,7 +74,8 @@ The install script (`scripts/install.sh`) runs a **pre-flight check** before any
 | **Git** | any | `git --version` | Warns but continues; pipeline works without git (no version history) |
 | **Disk space** | 2GB free | `df` (Unix) / `wmic` or `df` (Windows) | Reports exact available space; blocks root creation if insufficient |
 | **bash** | any | `bash --version` | Required on Windows (Git Bash, WSL); native on macOS/Linux |
-| **python-docx** | any | `python3 -c "import docx"` | Auto-installed via pip during Phase 9 |
+| **pandoc** | 2.0+ | `pandoc --version` | Preferred extractor; falls back to python-docx then ZIP+XML |
+| **python-docx** | any | `python3 -c "import docx"` | Auto-installed via pip; secondary extractor |
 | **tomli** | any | `python3 -c "import tomli"` | Auto-installed via pip during Phase 9; Python 3.11+ has stdlib fallback |
 
 ### What the agent sees on a target machine:
@@ -96,7 +97,8 @@ The install script (`scripts/install.sh`) runs a **pre-flight check** before any
 
 - **Git missing**: Pipeline runs without version history; `git commit` calls become no-ops
 - **pip missing on Windows**: Script falls back to `python -m pip` or `python -m ensurepip`
-- **python-docx fails to install**: Extraction falls back to ZIP + XML parsing (built into Python stdlib)
+- **python-docx fails to install**: Extraction falls back to pandoc (if installed) or ZIP + XML parsing (built into Python stdlib)
+- **pandoc missing**: Extraction uses python-docx; if both missing, ZIP+XML stdlib fallback
 - **tomli fails to install**: Python 3.11+ uses stdlib `tomllib`; for older Python, `json` fallback reads a converted config
 - **Cron setup fails** (permissions, missing schtasks): Manual instructions printed; pipeline still usable via `python3 pipeline.py scan`
 - **Disk space < 2GB**: Root creation blocked, error message shows exact available space
@@ -110,7 +112,7 @@ Phase 2: Root Create  -> C:\DocIntel (Win) or ~/DocIntel (Mac/Linux)
 Phase 3: Config       -> templates/config.toml -> root/config.toml (2GB memory allocated)
 Phase 4: Git Init     -> git init in root (tracks all collected data)
 Phase 5: Doc Scan     -> dir-by-dir sync walk -> collect .docx paths -> save index
-Phase 6: Cron Setup   -> daily 06:00 scan of Downloads, Desktop, Documents + platform dirs
+Phase 6: Cron Setup   -> TWO jobs: daily 06:00 scan + every 2hr delivery retry
 Phase 7: Parse Loop   -> wait 1000ms -> parse each .docx -> extract text
 Phase 8: Knowledge    -> hints, repetitive words, layout, reused assets, duplicates
 Phase 9: Actions + Proctor -> generate .docx, WhatsApp send, or stop -> validate pipeline
@@ -247,11 +249,19 @@ for each scan_directory in config:
 
 ---
 
-## Phase 6: Cron Setup (Daily 06:00)
+## Phase 6: Cron Setup (Dual Schedulers)
 
-The cron job scans common directories every day at 06:00 local time.
+**Two independent OS-level scheduler jobs** are created:
 
-**Scan targets by platform:**
+### Job 1: Daily Scan (06:00)
+Scans all configured directories for new .docx files.
+
+### Job 2: Delivery Retry (Every 2 Hours)
+Runs `pipeline.py deliver` — a lightweight command that only retries pending notifications. No scan, no extraction, no knowledge building. Exits immediately if `actions/pending/` is empty.
+
+**Why two jobs?** If the gateway is down at 06:00, the notification is queued. Instead of waiting 24 hours for the next scan cron, the 2-hour retry job picks it up within 2 hours — or retries every 2 hours until delivery succeeds or the max retry cap is hit.
+
+**Scheduler setup by platform:**
 
 | Platform | Directories Scanned |
 |----------|-------------------|
@@ -276,19 +286,26 @@ After collection completes, the pipeline enters the extraction loop:
 ```
 wait 1000ms
 for each unprocessed file in manifest:
-    parse .docx -> extract:
-        - full text (python-docx)
+    parse .docx (extractor priority: pandoc > python-docx > ZIP+XML):
+        pandoc:    pandoc file.docx -t plain --wrap=none
+                   + pandoc file.docx -t markdown (for heading/table counts)
+        fallback:  python-docx → ZIP + XML (stdlib, zero-dependency)
+    extract:
+        - full text (plain text or markdown-equivalent)
         - paragraph count
-        - heading structure (styles)
-        - embedded images count
-        - tables count
+        - heading count (from markdown # prefixes or Heading styles)
+        - table count (from markdown |---| patterns or doc.tables)
+        - embedded images count (from ZIP media listing)
     save extracted text to root/extracted/{file_hash}.txt
-    save metadata to root/extracted/{file_hash}.json
+    save metadata to root/extracted/{file_hash}.json (includes "extractor" field)
     git add + commit
     wait 1000ms between batches of config.extraction.batch_size
 ```
 
-**Wait rationale**: The 1000ms pause prevents CPU/disk contention and allows the system to remain responsive during large scans.
+**Why pandoc first?** Produces better plain text than any Python library — handles nested
+tables, columns, headers/footers, footnotes, and complex formatting that python-docx
+drops. Also supports .doc (legacy Word), .odt, and .rtf if you configure `file_types`
+to include them. Falls back transparently if not installed.
 
 ---
 
@@ -400,10 +417,12 @@ Create a summary .docx report:
 - Recommended actions
 
 ### Action: WhatsApp Send
-Send notifications via WhatsApp (requires Hermes gateway WhatsApp configured):
-- Daily scan summary
-- New documents found
-- Duplicate candidates found
+Send notifications via WhatsApp/Telegram (requires Hermes gateway configured).
+Uses a **dead-letter queue** for resilience:
+- On gateway failure: notification payload written to `actions/pending/scan_{timestamp}.json`
+- On next pipeline run: all pending notifications are retried automatically
+- After `max_retries` failures (default 3): moved to `actions/dead/` for manual review
+- **No notification is ever silently lost** — every failure is visible via `pipeline.py proctor`
 
 ### Action: Stop
 Graceful pipeline termination. Triggered when:
@@ -413,22 +432,34 @@ Graceful pipeline termination. Triggered when:
 
 ---
 
-## Phase 10: Proctor Validation
+## Phase 10: Proctor Validation (System-Only)
 
-The proctor validates every pipeline phase:
+The proctor validates every pipeline phase using **only mechanical, deterministic checks**.
+No agent judgment. No policy enforcement. No quality thresholds. It answers one question:
+"Can the pipeline run?" — not "Is the output good?"
 
 ```
-1. Root exists + writable + has >= 2GB free
-2. config.toml exists + valid TOML + memory = 2GB
-3. Git repo initialized + clean working tree
-4. Manifest populated (>= 1 file if scan ran)
-5. Extracted files match manifest count
-6. Knowledge files are valid JSONL
-7. Cron job is scheduled + next run time is valid
-8. Dependencies installed (python-docx, tomli, etc.)
+ 1. Root exists + writable
+ 2. Disk space >= 2GB
+ 3. config.toml exists + valid TOML + max_disk_gb = 2GB
+ 4. Git repo initialized
+ 5. Manifest populated (>= 1 file if scan ran)
+ 6. Extracted files match manifest count
+ 7. Knowledge files are valid JSONL (5 × parse check)
+ 8. Dependencies: python-docx, pandoc, tomli/tomllib
+ 9. Dead-letter queue: pending count, dead count
+10. Dual cron: scan job active, retry job active
+11. Config completeness: all 8 [sections] present
 ```
 
 Run proctor: `python3 scripts/pipeline.py proctor`
+
+**Agent decisions live elsewhere:**
+- Extractor quality → `cmd_extract()` logs a warning if <80% pandoc
+- Duplicate language → `cmd_knowledge()` logs a warning if non-soft language found
+
+The proctor stays pure infrastructure. Policy checks belong in the phases
+that produce the output, not in the validation gate.
 
 ---
 
@@ -454,6 +485,43 @@ When the agent loads this skill on a target machine:
 5. **Cron not running**: On macOS, launchd may need `launchctl load` after plist creation
 6. **Disk space**: The 2GB check is a minimum -- large document corpora may need more
 7. **Duplicate flagging is SOFT**: Never present duplicates as errors. Always use the language "might be a small change -- investigate" from config
+8. **Gateway down at cron time**: If Hermes gateway (Telegram/WhatsApp) is unreachable when the 06:00 scan fires, the notification is written to `actions/pending/`. It will be retried on every subsequent pipeline run (daily) until delivered or moved to `actions/dead/` after 3 failures. The proctor alerts on dead-letter items. **No notification is ever silently dropped.**
+
+### What Happens When the Gateway Is Down
+
+The pipeline and gateway are decoupled by design -- the OS-level cron runs the scan regardless of gateway health. Here is the exact failure path:
+
+```
+Cron fires at 06:00 → pipeline.py scan → extract → knowledge → actions
+                                                                    │
+                                                    ┌───────────────┴───────────────┐
+                                                    │                               │
+                                              Gateway UP                      Gateway DOWN
+                                                    │                               │
+                                            send_message()                   write to
+                                            → delivered ✓                    actions/pending/
+                                                                                    │
+                                                                            Every 2 hours (separate cron)
+                                                                            pipeline.py deliver
+                                                                            _retry_pending_deliveries()
+                                                                                    │
+                                                                    ┌───────────────┴───────────────┐
+                                                                    │                               │
+                                                              Gateway UP                      Still DOWN
+                                                                    │                               │
+                                                              delivered ✓                   retry_count += 1
+                                                                                            save back to pending/
+                                                                                                    │
+                                                                                            After 3 failures
+                                                                                            → actions/dead/
+                                                                                            proctor alerts ⚠
+```
+
+**Key invariants:**
+- The scan + extraction pipeline **never waits** for delivery -- it always completes
+- Pending notifications survive reboots (they're JSON files on disk)
+- Dead-letter items are never auto-deleted -- human review required
+- `pipeline.py proctor` shows pending/dead counts and fails if `alert_on_dead_letter=true`
 
 ## Verification Checklist
 
@@ -476,6 +544,7 @@ After deployment, verify:
 | `python3 scripts/pipeline.py knowledge` | Analyze corpus: hints, words, layout, assets, duplicates | `knowledge/*.jsonl` |
 | `python3 scripts/pipeline.py actions` | Generate .docx report, WhatsApp notify, or stop | `actions/summary_{date}.docx` |
 | `python3 scripts/pipeline.py proctor` | Validate entire pipeline (8 checks) | stdout (pass/fail per check) |
+| `python3 scripts/pipeline.py deliver` | Retry all pending notifications (lightweight, no scan) | stdout + updates `actions/pending/` |
 | `python3 scripts/pipeline.py full` | Run scan -> extract -> knowledge -> actions -> proctor | All of the above |
 | `bash scripts/install.sh` | OS detect, root create, config write, git init, deps, cron | `$ROOT/` (everything) |
 | `source scripts/env.sh` | Set ROOT, PYTHON, CONFIG_PATH in current shell | Environment variables |

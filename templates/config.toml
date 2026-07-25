@@ -67,6 +67,10 @@ pipeline_script = "scripts/pipeline.py"
 # ---------------------------------------------------------------------------
 
 [extraction]
+# Extractor priority: "pandoc" (best), "python-docx", "zip-xml" (stdlib), or "auto"
+# "auto" selects: pandoc > python-docx > zip-xml based on what's installed
+extractor = "auto"
+
 # Pause between batch parses (milliseconds)
 pause_ms = 1000
 
@@ -113,7 +117,7 @@ min_corpus_size = 3
 # Generate summary .docx report after extraction
 generate_docx = true
 
-# Send notifications via WhatsApp (requires Hermes gateway)
+# Send notifications via WhatsApp/Telegram (requires Hermes gateway)
 whatsapp_send = true
 
 # Stop pipeline after all documents are processed
@@ -121,6 +125,27 @@ stop_on_complete = false
 
 # Output directory for generated reports
 output_dir = "actions"
+
+# ---------------------------------------------------------------------------
+# Delivery resilience — dead-letter queue for when gateway is down
+# ---------------------------------------------------------------------------
+
+[delivery]
+# Target platform for notifications: "telegram", "whatsapp", or "discord"
+target = "telegram"
+
+# Optional webhook URL for direct HTTP delivery (bypasses Hermes gateway)
+# Leave empty to use the dead-letter queue + companion Hermes cron job.
+webhook_url = ""
+
+# Max retry attempts before moving notification to dead-letter
+max_retries = 3
+
+# Retry interval: notifications are retried on each pipeline run (daily at 06:00)
+# So max_retries=3 means up to 3 days of retries before moving to dead/
+
+# If true, the proctor fails when dead-letter queue has items
+alert_on_dead_letter = true
 
 # ---------------------------------------------------------------------------
 # Proctor / Validation

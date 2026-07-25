@@ -217,11 +217,34 @@ def cmd_scan(cfg: dict):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def cmd_extract(cfg: dict):
-    """Parse all unprocessed .docx files from the manifest."""
+    """Parse all unprocessed .docx files from the manifest.
+    Uses pandoc as primary extractor (best quality, multi-format).
+    Falls back to python-docx, then ZIP+XML (stdlib only)."""
     ensure_dirs()
     ext_cfg = cfg.get("extraction", {})
     pause_ms = ext_cfg.get("pause_ms", 1000)
     batch_size = ext_cfg.get("batch_size", 10)
+    extractor = ext_cfg.get("extractor", "auto")  # "pandoc", "python-docx", or "auto"
+
+    # Detect available extractors
+    HAS_PANDOC = shutil.which("pandoc") is not None
+    HAS_PYTHON_DOCX = False
+    try:
+        import docx as _docx  # noqa: F401
+        HAS_PYTHON_DOCX = True
+    except ImportError:
+        pass
+
+    # Resolve extractor
+    if extractor == "auto":
+        if HAS_PANDOC:
+            extractor = "pandoc"
+        elif HAS_PYTHON_DOCX:
+            extractor = "python-docx"
+        else:
+            extractor = "zip-xml"  # stdlib fallback
+
+    log(f"Extractor: {extractor} (pandoc={'yes' if HAS_PANDOC else 'no'}, python-docx={'yes' if HAS_PYTHON_DOCX else 'no'})")
 
     manifest_path = ROOT / "collected" / "manifest.jsonl"
     if not manifest_path.exists():
@@ -262,44 +285,12 @@ def cmd_extract(cfg: dict):
         log(f"  [{i+1}/{len(to_process)}] {Path(fpath).name}")
 
         try:
-            # Try python-docx parsing
-            try:
-                from docx import Document
-                doc = Document(fpath)
-                text_parts = []
-                heading_count = 0
-                table_count = len(doc.tables)
-                image_count = 0
-
-                for para in doc.paragraphs:
-                    text_parts.append(para.text)
-                    if para.style and para.style.name and "Heading" in para.style.name:
-                        heading_count += 1
-
-                # Count images in relationships
-                for rel in doc.part.rels.values():
-                    if "image" in rel.reltype:
-                        image_count += 1
-
-                full_text = "\n".join(text_parts)
-                para_count = len(doc.paragraphs)
-
-            except ImportError:
-                log("python-docx not installed. Falling back to ZIP extraction.", "WARNING")
-                # Fallback: .docx is a ZIP, extract document.xml
-                import zipfile
-                from xml.etree import ElementTree as ET
-
-                with zipfile.ZipFile(fpath, "r") as zf:
-                    xml_content = zf.read("word/document.xml")
-                root_el = ET.fromstring(xml_content)
-                ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-                text_parts = [t.text or "" for t in root_el.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")]
-                full_text = " ".join(text_parts)
-                para_count = len([p for p in root_el.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p")])
-                heading_count = 0
-                table_count = 0
-                image_count = 0
+            if extractor == "pandoc":
+                full_text, para_count, heading_count, table_count, image_count = _extract_pandoc(fpath)
+            elif extractor == "python-docx":
+                full_text, para_count, heading_count, table_count, image_count = _extract_python_docx(fpath)
+            else:
+                full_text, para_count, heading_count, table_count, image_count = _extract_zip_xml(fpath)
 
             # Save extracted text
             text_path = extracted_dir / f"{fhash}.txt"
@@ -317,6 +308,7 @@ def cmd_extract(cfg: dict):
                 "images": image_count,
                 "char_count": len(full_text),
                 "word_count": len(full_text.split()),
+                "extractor": extractor,
                 "extracted_at": datetime.now(timezone.utc).isoformat(),
             }
             meta_path = extracted_dir / f"{fhash}.json"
@@ -326,6 +318,59 @@ def cmd_extract(cfg: dict):
             processed += 1
 
         except Exception as e:
+            # If pandoc fails, try python-docx fallback
+            if extractor == "pandoc" and HAS_PYTHON_DOCX:
+                log(f"  pandoc failed ({e}), trying python-docx fallback...", "WARNING")
+                try:
+                    full_text, para_count, heading_count, table_count, image_count = _extract_python_docx(fpath)
+                    extractor_used = "python-docx(fallback)"
+                    # Save (same logic as above but with fallback tag)
+                    text_path = extracted_dir / f"{fhash}.txt"
+                    with open(text_path, "w", encoding="utf-8") as tf:
+                        tf.write(full_text)
+                    meta = {
+                        "source_path": fpath, "hash": fhash,
+                        "size_bytes": entry.get("size_bytes", 0),
+                        "paragraphs": para_count, "headings": heading_count,
+                        "tables": table_count, "images": image_count,
+                        "char_count": len(full_text), "word_count": len(full_text.split()),
+                        "extractor": extractor_used,
+                        "extracted_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    meta_path = extracted_dir / f"{fhash}.json"
+                    with open(meta_path, "w") as mf:
+                        json.dump(meta, mf, indent=2)
+                    processed += 1
+                    continue
+                except Exception as e2:
+                    log(f"  python-docx fallback also failed: {e2}", "ERROR")
+
+            elif extractor == "pandoc":
+                # No python-docx, try ZIP fallback
+                log(f"  pandoc failed ({e}), trying ZIP/XML fallback...", "WARNING")
+                try:
+                    full_text, para_count, heading_count, table_count, image_count = _extract_zip_xml(fpath)
+                    extractor_used = "zip-xml(fallback)"
+                    text_path = extracted_dir / f"{fhash}.txt"
+                    with open(text_path, "w", encoding="utf-8") as tf:
+                        tf.write(full_text)
+                    meta = {
+                        "source_path": fpath, "hash": fhash,
+                        "size_bytes": entry.get("size_bytes", 0),
+                        "paragraphs": para_count, "headings": heading_count,
+                        "tables": table_count, "images": image_count,
+                        "char_count": len(full_text), "word_count": len(full_text.split()),
+                        "extractor": extractor_used,
+                        "extracted_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    meta_path = extracted_dir / f"{fhash}.json"
+                    with open(meta_path, "w") as mf:
+                        json.dump(meta, mf, indent=2)
+                    processed += 1
+                    continue
+                except Exception as e3:
+                    log(f"  ZIP fallback also failed: {e3}", "ERROR")
+
             log(f"  FAILED: {e}", "ERROR")
             failed += 1
 
@@ -335,9 +380,121 @@ def cmd_extract(cfg: dict):
             time.sleep(pause_ms / 1000.0)
 
     log(f"Extraction complete: {processed} processed, {failed} failed")
-    git_commit(f"extract: {processed} files processed, {failed} failed")
+    git_commit(f"extract: {processed} files processed ({extractor}), {failed} failed")
+
+    # ── Agent decision: is the extractor quality acceptable? ────────────
+    if processed > 0:
+        # Count which extractor was actually used (check metadata files)
+        ex_counts = {"pandoc": 0, "python-docx": 0, "fallback": 0}
+        for meta_file in extracted_dir.glob("*.json"):
+            try:
+                with open(meta_file, "r") as f:
+                    meta = json.load(f)
+                ex = meta.get("extractor", "")
+                if ex == "pandoc":
+                    ex_counts["pandoc"] += 1
+                elif "fallback" in ex:
+                    ex_counts["fallback"] += 1
+                else:
+                    ex_counts["python-docx"] += 1
+            except Exception:
+                pass
+        total = sum(ex_counts.values())
+        pandoc_pct = ex_counts["pandoc"] / total * 100 if total > 0 else 0
+        fallback_pct = ex_counts["fallback"] / total * 100 if total > 0 else 0
+        if pandoc_pct >= 80:
+            log(f"Extractor quality: {pandoc_pct:.0f}% pandoc — good")
+        elif pandoc_pct > 0:
+            log(f"Extractor quality: {pandoc_pct:.0f}% pandoc, {fallback_pct:.0f}% fallback — consider installing pandoc for remaining files", "WARNING")
+        else:
+            log(f"Extractor quality: 0% pandoc ({total} files via fallback) — install pandoc for best results: brew/apt/winget install pandoc", "WARNING")
 
     return processed
+
+
+def _extract_pandoc(fpath: str):
+    """Extract text using pandoc → markdown → plain text.
+    Preserves structure better than any Python library."""
+    import subprocess
+
+    # Convert to plain text via pandoc
+    result = subprocess.run(
+        ["pandoc", fpath, "-t", "plain", "--wrap=none"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"pandoc exited {result.returncode}: {result.stderr[:200]}")
+
+    full_text = result.stdout
+
+    # Count paragraphs (non-empty lines)
+    para_count = len([l for l in full_text.split("\n") if l.strip()])
+
+    # For heading count, convert to markdown and count #-prefixed lines
+    md_result = subprocess.run(
+        ["pandoc", fpath, "-t", "markdown", "--wrap=none"],
+        capture_output=True, text=True, timeout=60,
+    )
+    heading_count = 0
+    if md_result.returncode == 0:
+        heading_count = len([l for l in md_result.stdout.split("\n") if l.strip().startswith("#")])
+
+    # Table count: convert to markdown and count |----| patterns
+    table_count = 0
+    if md_result.returncode == 0:
+        in_table = False
+        for line in md_result.stdout.split("\n"):
+            if "|---" in line or "| ---" in line:
+                table_count += 1
+
+    # Image count: extract media via pandoc
+    image_count = 0
+    try:
+        import zipfile
+        with zipfile.ZipFile(fpath, "r") as zf:
+            image_count = sum(1 for n in zf.namelist() if n.startswith("word/media/") and not n.endswith("/"))
+    except Exception:
+        pass
+
+    return full_text, para_count, heading_count, table_count, image_count
+
+
+def _extract_python_docx(fpath: str):
+    """Extract using python-docx library."""
+    from docx import Document
+    doc = Document(fpath)
+    text_parts = []
+    heading_count = 0
+    table_count = len(doc.tables)
+    image_count = 0
+
+    for para in doc.paragraphs:
+        text_parts.append(para.text)
+        if para.style and para.style.name and "Heading" in para.style.name:
+            heading_count += 1
+
+    for rel in doc.part.rels.values():
+        if "image" in rel.reltype:
+            image_count += 1
+
+    full_text = "\n".join(text_parts)
+    para_count = len(doc.paragraphs)
+    return full_text, para_count, heading_count, table_count, image_count
+
+
+def _extract_zip_xml(fpath: str):
+    """Extract using stdlib ZIP + XML parsing (no dependencies)."""
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    with zipfile.ZipFile(fpath, "r") as zf:
+        xml_content = zf.read("word/document.xml")
+    root_el = ET.fromstring(xml_content)
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    text_parts = [t.text or "" for t in root_el.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t")]
+    full_text = " ".join(text_parts)
+    para_count = len([p for p in root_el.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p")])
+    return full_text, para_count, 0, 0, 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -556,6 +713,23 @@ def cmd_knowledge(cfg: dict):
         log(f"  Duplicates (soft-flagged): {dup_count} candidate pairs")
         results["duplicates"] = dup_count
 
+        # ── Agent decision: verify language compliance ──────────────────
+        if dup_count > 0:
+            violations = 0
+            with open(dup_out, "r") as df_check:
+                for line in df_check:
+                    if line.strip():
+                        entry = json.loads(line)
+                        if entry.get("flag") != "soft":
+                            violations += 1
+                        msg = entry.get("message", "")
+                        if any(w in msg.lower() for w in ["error", "problem", "conflict"]):
+                            violations += 1
+            if violations > 0:
+                log(f"Duplicate language: {violations} violations — all entries must use flag='soft' and say 'might be a small change - investigate'", "WARNING")
+            else:
+                log(f"Duplicate language: all {dup_count} entries compliant (flag=soft, no error/problem/conflict language)")
+
     git_commit(f"knowledge: hints={results['hints']} rep_words={results['repetitive_words']} "
                f"layouts={results['layout_patterns']} assets={results['reused_assets']} "
                f"dupes={results['duplicates']}")
@@ -568,15 +742,25 @@ def cmd_knowledge(cfg: dict):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def cmd_actions(cfg: dict):
-    """Build actions based on knowledge."""
+    """Build actions based on knowledge. Writes notifications to dead-letter
+    queue for resilient delivery — if gateway is down, notifications survive."""
     ensure_dirs()
     act_cfg = cfg.get("actions", {})
+    delivery_cfg = cfg.get("delivery", {})
     knowledge_dir = ROOT / "knowledge"
     actions_dir = ROOT / "actions"
+    pending_dir = actions_dir / "pending"
+    dead_dir = actions_dir / "dead"
+    max_retries = delivery_cfg.get("max_retries", 3)
+
+    # ── First: retry any pending deliveries from previous runs ──────────
+    retried, delivered, dead = _retry_pending_deliveries(pending_dir, dead_dir, max_retries)
 
     report_parts = []
     report_parts.append("=== Doc Intelligence Pipeline — Summary Report ===\n")
     report_parts.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    if retried > 0:
+        report_parts.append(f"Delivery retry: {delivered} sent, {dead} moved to dead-letter\n")
 
     # Count collected documents
     manifest = ROOT / "collected" / "manifest.jsonl"
@@ -621,12 +805,29 @@ def cmd_actions(cfg: dict):
             log("python-docx not installed. Skipping .docx report generation.", "WARNING")
             log("Report text:\n" + report_text)
 
-    # ── Action: WhatsApp Send ──────────────────────────────────────────
+    # ── Action: WhatsApp / Telegram Send (dead-letter queue) ────────────
     if act_cfg.get("whatsapp_send", True):
-        log("WhatsApp send action: requires Hermes gateway WhatsApp configured.")
-        log(f"Would send: {doc_count} documents, {report_text[:200]}...")
-        # In production, this would use the Hermes messaging tool or WhatsApp API.
-        # The agent should call send_message or use the gateway.
+        delivery_ok = _attempt_delivery(report_text, doc_count, delivery_cfg)
+        if delivery_ok:
+            log("Notification delivered successfully")
+        else:
+            # Gateway down or delivery failed — enqueue to dead-letter
+            pending_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            payload_path = pending_dir / f"scan_{ts}.json"
+            payload = {
+                "type": "scan_summary",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "retry_count": 0,
+                "max_retries": max_retries,
+                "report_text": report_text,
+                "doc_count": doc_count,
+                "target": delivery_cfg.get("target", "telegram"),
+            }
+            with open(payload_path, "w") as pf:
+                json.dump(payload, pf, indent=2)
+            log(f"Delivery failed — notification queued: {payload_path}", "WARNING")
+            log(f"Gateway may be down. Will retry on next pipeline run (max {max_retries} attempts).")
 
     # ── Action: Stop ───────────────────────────────────────────────────
     if act_cfg.get("stop_on_complete", False):
@@ -634,6 +835,147 @@ def cmd_actions(cfg: dict):
         return 0
 
     return 1
+
+
+def _attempt_delivery(report_text: str, doc_count: int, delivery_cfg: dict) -> bool:
+    """Try to deliver a notification. Returns True if delivered, False if
+    the gateway is unreachable (notification should be queued).
+
+    Attempts in order:
+      1. Hermes gateway webhook (if configured)
+      2. Local marker file that a Hermes cron job picks up
+      3. stdout message that the agent can act on
+
+    Always returns False if no delivery method is configured — this is NOT
+    a failure, it means the notification is queued for the companion cron job.
+    """
+    target = delivery_cfg.get("target", "telegram")
+    webhook_url = delivery_cfg.get("webhook_url", "")
+
+    # Method 1: Direct webhook (if user configured an HTTP endpoint)
+    if webhook_url:
+        try:
+            import urllib.request
+            payload = json.dumps({
+                "text": report_text[:500],
+                "doc_count": doc_count,
+                "source": "doc-intelligence-pipeline",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }).encode("utf-8")
+            req = urllib.request.Request(webhook_url, data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST")
+            urllib.request.urlopen(req, timeout=10)
+            return True
+        except Exception as e:
+            log(f"Webhook delivery failed: {e}", "WARNING")
+            return False
+
+    # Method 2: Check if we're running inside Hermes (agent can call send_message)
+    # We can't call Hermes tools from a standalone script, but we signal intent.
+    hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+    signal_file = Path(hermes_home) / "pending_notifications" / f"docintel_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    try:
+        signal_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(signal_file, "w") as sf:
+            json.dump({
+                "pipeline": "doc-intelligence-pipeline",
+                "action": "send_scan_summary",
+                "doc_count": doc_count,
+                "preview": report_text[:300],
+                "target_platform": target,
+            }, sf)
+        log(f"Signal written for Hermes agent: {signal_file}")
+    except Exception:
+        pass  # Signal file is best-effort; the pending queue is the source of truth
+
+    # Method 3: Return False — notification will be queued in actions/pending/
+    # The companion Hermes cron job reads this directory and delivers.
+    return bool(webhook_url)  # Only True if webhook succeeded
+
+
+def _retry_pending_deliveries(pending_dir: Path, dead_dir: Path, max_retries: int):
+    """Retry any notifications queued from previous failed runs.
+
+    Returns (total_pending, delivered, moved_to_dead).
+    """
+    if not pending_dir.exists():
+        return 0, 0, 0
+
+    pending_files = sorted(pending_dir.glob("*.json"))
+    if not pending_files:
+        return 0, 0, 0
+
+    retried = len(pending_files)
+    delivered = 0
+    dead = 0
+
+    for pf_path in pending_files:
+        try:
+            with open(pf_path, "r") as f:
+                payload = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pf_path.unlink(missing_ok=True)
+            continue
+
+        retry_count = payload.get("retry_count", 0)
+
+        # Exceeded max retries — move to dead-letter
+        if retry_count >= max_retries:
+            dead_dir.mkdir(parents=True, exist_ok=True)
+            payload["moved_to_dead_at"] = datetime.now(timezone.utc).isoformat()
+            payload["reason"] = f"Exceeded max retries ({max_retries})"
+            dead_path = dead_dir / pf_path.name
+            with open(dead_path, "w") as df:
+                json.dump(payload, df, indent=2)
+            pf_path.unlink()
+            dead += 1
+            log(f"DEAD-LETTER: {pf_path.name} exceeded {max_retries} retries → {dead_path}", "ERROR")
+            continue
+
+        # Attempt redelivery
+        delivery_cfg = {"target": payload.get("target", "telegram")}
+        ok = _attempt_delivery(
+            payload.get("report_text", ""),
+            payload.get("doc_count", 0),
+            delivery_cfg,
+        )
+
+        if ok:
+            pf_path.unlink()
+            delivered += 1
+            log(f"Retry succeeded: {pf_path.name}")
+        else:
+            # Increment retry count and save
+            payload["retry_count"] = retry_count + 1
+            payload["last_retry_at"] = datetime.now(timezone.utc).isoformat()
+            with open(pf_path, "w") as f:
+                json.dump(payload, f, indent=2)
+            log(f"Retry {retry_count + 1}/{max_retries} failed: {pf_path.name} — will retry next run", "WARNING")
+
+    return retried, delivered, dead
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DELIVER: Retry-only loop — runs every 2 hours via cron, no scan overhead
+# ═══════════════════════════════════════════════════════════════════════════
+
+def cmd_deliver(cfg: dict):
+    """Retry pending deliveries only. No scan, no extract, no knowledge build.
+    Designed to run every 2 hours via a separate lightweight cron job.
+    Returns 0 if nothing to deliver (clean), 1 if deliveries were attempted."""
+    ensure_dirs()
+    delivery_cfg = cfg.get("delivery", {})
+    max_retries = delivery_cfg.get("max_retries", 3)
+    pending_dir = ROOT / "actions" / "pending"
+    dead_dir = ROOT / "actions" / "dead"
+
+    if not pending_dir.exists() or not any(pending_dir.glob("*.json")):
+        return 0  # Nothing to do — clean exit, no log noise
+
+    retried, delivered, dead = _retry_pending_deliveries(pending_dir, dead_dir, max_retries)
+    log(f"deliver: {retried} pending, {delivered} sent, {dead} dead-lettered")
+    return 1 if retried > 0 else 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -737,6 +1079,17 @@ def cmd_proctor(cfg: dict):
     except ImportError:
         check("python-docx installed", False, "Run: pip install python-docx", warn=True)
 
+    HAS_PANDOC = shutil.which("pandoc") is not None
+    if HAS_PANDOC:
+        import subprocess as _sp
+        try:
+            ver = _sp.run(["pandoc", "--version"], capture_output=True, text=True, timeout=5)
+            check(f"pandoc: {ver.stdout.split(chr(10))[0]}", True)
+        except Exception:
+            check("pandoc installed", True)
+    else:
+        check("pandoc installed", False, "Install: brew install pandoc / apt install pandoc", warn=True)
+
     try:
         import tomli  # noqa: F401
         check("tomli installed", True)
@@ -746,6 +1099,77 @@ def cmd_proctor(cfg: dict):
             check("tomllib (stdlib) available", True)
         except ImportError:
             check("tomli/tomllib installed", False, "Run: pip install tomli", warn=True)
+
+    # 9. Dead-letter queue health
+    pending_dir = ROOT / "actions" / "pending"
+    dead_dir = ROOT / "actions" / "dead"
+    pending_count = len(list(pending_dir.glob("*.json"))) if pending_dir.exists() else 0
+    dead_count = len(list(dead_dir.glob("*.json"))) if dead_dir.exists() else 0
+
+    if pending_count > 0:
+        check(f"Pending deliveries: {pending_count}", pending_count < 5,
+              f"{pending_count} notifications queued — gateway may be down",
+              warn=True)
+    else:
+        check("Pending deliveries: 0 (clean)", True)
+
+    if dead_count > 0:
+        delivery_cfg = cfg.get("delivery", {})
+        alert_on_dead = delivery_cfg.get("alert_on_dead_letter", True)
+        check(f"Dead-letter queue: {dead_count}", not alert_on_dead,
+              f"{dead_count} notifications in dead-letter after max retries — review {dead_dir}",
+              warn=(not alert_on_dead))
+        if dead_count > 0:
+            print(f"         Dead-letter items in: {dead_dir}")
+            for df_path in sorted(dead_dir.glob("*.json"))[:5]:
+                print(f"           {df_path.name}")
+    else:
+        check("Dead-letter queue: 0 (clean)", True)
+
+    # 10. Dual cron health — check both scan and retry schedulers exist
+    if sys.platform == "darwin":
+        scan_plist = Path.home() / "Library/LaunchAgents/com.docintel.scan.plist"
+        retry_plist = Path.home() / "Library/LaunchAgents/com.docintel.deliver.plist"
+        scan_loaded = False
+        retry_loaded = False
+        try:
+            result = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5)
+            scan_loaded = "com.docintel.scan" in result.stdout
+            retry_loaded = "com.docintel.deliver" in result.stdout
+        except Exception:
+            pass
+        check("Cron: scan job (launchd com.docintel.scan)", scan_plist.exists() or scan_loaded,
+              "Missing — run install.sh to recreate", warn=True)
+        check("Cron: retry job (launchd com.docintel.deliver)", retry_plist.exists() or retry_loaded,
+              "Missing — dead-letter queue will retry on next scan only", warn=True)
+    elif sys.platform == "linux":
+        try:
+            cron_out = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=5)
+            has_scan = "pipeline.py scan" in cron_out.stdout
+            has_deliver = "pipeline.py deliver" in cron_out.stdout
+        except Exception:
+            has_scan = has_deliver = False
+        check("Cron: scan job (crontab 06:00)", has_scan, "Missing — run install.sh", warn=True)
+        check("Cron: retry job (crontab */2hr)", has_deliver, "Missing — dead-letter retries on next scan only", warn=True)
+    elif sys.platform == "win32":
+        try:
+            tasks = subprocess.run(["schtasks", "/query", "/fo", "list"], capture_output=True, text=True, timeout=10)
+            has_scan = "DocIntelScan" in tasks.stdout
+            has_deliver = "DocIntelDeliver" in tasks.stdout
+        except Exception:
+            has_scan = has_deliver = False
+        check("Cron: scan task (schtasks DocIntelScan)", has_scan, "Missing — run install.sh as admin", warn=True)
+        check("Cron: retry task (schtasks DocIntelDeliver)", has_deliver, "Missing — dead-letter retries on next scan only", warn=True)
+
+    # 12. Config section completeness
+    check("config.toml: [memory] section", "memory" in cfg, "Missing [memory] section")
+    check("config.toml: [scan] section", "scan" in cfg, "Missing [scan] section")
+    check("config.toml: [extraction] section", "extraction" in cfg, "Missing [extraction] section")
+    check("config.toml: [knowledge] section", "knowledge" in cfg, "Missing [knowledge] section")
+    check("config.toml: [actions] section", "actions" in cfg, "Missing [actions] section")
+    check("config.toml: [delivery] section", "delivery" in cfg, "Missing [delivery] section — dead-letter queue disabled", warn=True)
+    check("config.toml: [proctor] section", "proctor" in cfg, "Missing [proctor] section")
+    check("config.toml: [logging] section", "logging" in cfg, "Missing [logging] section")
 
     # ── Summary ────────────────────────────────────────────────────────
     print()
@@ -793,6 +1217,7 @@ def main():
         "extract": lambda: cmd_extract(cfg),
         "knowledge": lambda: cmd_knowledge(cfg),
         "actions": lambda: cmd_actions(cfg),
+        "deliver": lambda: cmd_deliver(cfg),
         "proctor": lambda: cmd_proctor(cfg),
         "full": lambda: run_full(cfg),
     }

@@ -3,6 +3,33 @@
 How `pipeline.py knowledge` detects each of the 5 pattern types. This reference
 documents the algorithms, tuning knobs, and edge cases.
 
+## Extractor Stack
+
+The pipeline uses a 3-tier extractor stack, auto-selected by `extractor = "auto"`
+in config.toml:
+
+| Tier | Extractor | Quality | Dependencies | Fallback |
+|------|-----------|---------|-------------|----------|
+| 1 (preferred) | **pandoc** | Best — handles nested tables, columns, headers, footnotes | `pandoc` binary (brew/apt/winget) | Falls to tier 2 |
+| 2 | **python-docx** | Good — handles basic formatting, tables, headings | `pip install python-docx` | Falls to tier 3 |
+| 3 (always available) | **ZIP + XML** | Basic — extracts raw text, no structure | Python stdlib only | None |
+
+Each extracted file's metadata includes an `"extractor"` field showing which
+tier was used: `"pandoc"`, `"python-docx"`, `"python-docx(fallback)"`, or `"zip-xml"`.
+
+### Pandoc extraction details
+
+```
+pandoc file.docx -t plain --wrap=none     → plain text (primary)
+pandoc file.docx -t markdown --wrap=none  → markdown (for structure counting)
+```
+
+- **Paragraphs**: counted from non-empty lines in plain text output
+- **Headings**: counted from `#`-prefixed lines in markdown output (captures H1-H6)
+- **Tables**: counted from `|---|` separator rows in markdown output
+- **Images**: counted from ZIP media listing (`word/media/*`)
+- **Timeout**: 60 seconds per file (handles very large documents)
+
 ---
 
 ## 1. Hints Detection

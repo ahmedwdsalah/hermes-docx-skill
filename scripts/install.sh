@@ -265,6 +265,26 @@ echo ""
 # ── 0.7 Python packages — python-docx ──────────────────────────────────────
 banner "Checking Python packages..."
 
+# ── 0.7a: pandoc (preferred extractor) ─────────────────────────────────────
+banner "Checking pandoc (document converter)..."
+
+HAS_PANDOC=false
+PANDOC_VER=""
+if cmd_path=$(command -v pandoc 2>/dev/null); then
+    PANDOC_VER=$("$cmd_path" --version 2>/dev/null | head -1)
+    HAS_PANDOC=true
+    pass "pandoc found: $PANDOC_VER"
+    record "pandoc" "PASS" "$PANDOC_VER"
+else
+    warn "pandoc not found — will fall back to python-docx (lower quality)"
+    case "$OS" in
+        macos)   detail "Install: brew install pandoc" ;;
+        linux)   detail "Install: sudo apt install pandoc   (or: sudo dnf install pandoc)" ;;
+        windows) detail "Install: winget install Pandoc   (or: https://pandoc.org/installing.html)" ;;
+    esac
+    record "pandoc" "WARN" "not found; python-docx fallback"
+fi
+
 if [[ -n "$PYTHON" ]]; then
     if "$PYTHON" -c "import docx" 2>/dev/null; then
         DOCX_VER=$("$PYTHON" -c "import docx; print(getattr(docx, '__version__', 'installed'))" 2>/dev/null || echo "installed")
@@ -303,7 +323,7 @@ echo -e "${BOLD}─────────────────────�
 passed_count=0
 failed_count=0
 warn_count=0
-for phase in python pip git bash disk_space python-docx tomli; do
+for phase in python pip git bash disk_space pandoc python-docx tomli; do
     case "${CHECK_RESULTS[$phase]:-SKIP}" in
         PASS) ((passed_count++)) ;;
         FAIL) ((failed_count++)) ;;
@@ -320,7 +340,7 @@ if [[ $failed_count -gt 0 ]]; then
     echo ""
     echo -e "  ${RED}${BOLD}BLOCKERS DETECTED.${NC} Fix the failures above before proceeding."
     echo "  Failed checks:"
-    for phase in python pip git bash disk_space python-docx tomli; do
+    for phase in python pip git bash disk_space pandoc python-docx tomli; do
         if [[ "${CHECK_RESULTS[$phase]}" == "FAIL" ]]; then
             echo -e "    ${RED}✗${NC} $phase: ${CHECK_DETAILS[$phase]}"
         fi
@@ -561,7 +581,41 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 
 echo ""
-banner "Phase 5: Python Dependencies"
+banner "Phase 5: Dependencies"
+
+# ── pandoc (try to install if missing) ──────────────────────────────────────
+if [[ "$HAS_PANDOC" != true ]]; then
+    info "Attempting to install pandoc..."
+    case "$OS" in
+        macos)
+            if command -v brew &>/dev/null; then
+                brew install pandoc 2>/dev/null && HAS_PANDOC=true && pass "pandoc installed via Homebrew"
+            else
+                warn "Homebrew not found — install pandoc manually: brew install pandoc"
+            fi
+            ;;
+        linux)
+            if command -v apt-get &>/dev/null; then
+                sudo apt-get install -y pandoc 2>/dev/null && HAS_PANDOC=true && pass "pandoc installed via apt"
+            elif command -v dnf &>/dev/null; then
+                sudo dnf install -y pandoc 2>/dev/null && HAS_PANDOC=true && pass "pandoc installed via dnf"
+            else
+                warn "No package manager found — install pandoc manually"
+            fi
+            ;;
+        windows)
+            if command -v winget &>/dev/null; then
+                winget install Pandoc 2>/dev/null && HAS_PANDOC=true && pass "pandoc installed via winget"
+            elif command -v choco &>/dev/null; then
+                choco install pandoc -y 2>/dev/null && HAS_PANDOC=true && pass "pandoc installed via Chocolatey"
+            else
+                warn "No package manager — download from https://pandoc.org/installing.html"
+            fi
+            ;;
+    esac
+fi
+
+# ── Python packages ────────────────────────────────────────────────────────
 
 install_pkg() {
     local pkg="$1"
@@ -632,10 +686,11 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 
 echo ""
-banner "Phase 6: Daily Scan Scheduler (06:00)"
+banner "Phase 6: Dual Schedulers — Daily Scan (06:00) + 2hr Delivery Retry"
 
 PIPELINE_PATH="$ROOT/scripts/pipeline.py"
 CRON_OK=false
+RETRY_CRON_OK=false
 
 case "$OS" in
     macos)
@@ -683,16 +738,55 @@ PLIST
             detail "launchctl load $PLIST"
             record "cron" "WARN" "launchd plist written, not loaded"
         fi
+
+        # ── 2-hour retry job for pending deliveries ─────────────────
+        local retry_plist="$HOME/Library/LaunchAgents/com.docintel.deliver.plist"
+        cat > "$retry_plist" << RETRYPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.docintel.deliver</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$PYTHON</string>
+        <string>$PIPELINE_PATH</string>
+        <string>deliver</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>7200</integer>
+    <key>WorkingDirectory</key>
+    <string>$ROOT</string>
+    <key>StandardOutPath</key>
+    <string>$ROOT/logs/deliver_stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>$ROOT/logs/deliver_stderr.log</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+RETRYPLIST
+        launchctl unload "$retry_plist" 2>/dev/null || true
+        if launchctl load "$retry_plist" 2>/dev/null; then
+            pass "launchd retry job: com.docintel.deliver (every 2hr)"
+            RETRY_CRON_OK=true
+        else
+            warn "launchd retry load failed — load manually:"
+            detail "launchctl load $retry_plist"
+        fi
         ;;
 
     linux)
         CRON_CMD="0 6 * * * cd '$ROOT' && '$PYTHON' '$PIPELINE_PATH' scan >> '$ROOT/logs/cron_stdout.log' 2>> '$ROOT/logs/cron_stderr.log'"
+        RETRY_CMD="0 */2 * * * cd '$ROOT' && '$PYTHON' '$PIPELINE_PATH' deliver >> '$ROOT/logs/deliver_stdout.log' 2>> '$ROOT/logs/deliver_stderr.log'"
         if crontab -l 2>/dev/null | grep -q "pipeline.py scan"; then
-            pass "Cron job already in crontab"
+            pass "Cron scan job already in crontab"
             CRON_OK=true
             record "cron" "PASS" "crontab (already present)"
         elif (crontab -l 2>/dev/null || true; echo "$CRON_CMD") | crontab - 2>/dev/null; then
-            pass "Cron job added: daily 06:00 scan"
+            pass "Cron scan job added: daily 06:00"
             CRON_OK=true
             record "cron" "PASS" "crontab"
         else
@@ -701,14 +795,27 @@ PLIST
             detail "Add: $CRON_CMD"
             record "cron" "WARN" "crontab add failed"
         fi
+        # Retry job: every 2 hours
+        if crontab -l 2>/dev/null | grep -q "pipeline.py deliver"; then
+            pass "Cron retry job already in crontab (every 2hr)"
+            RETRY_CRON_OK=true
+        elif (crontab -l 2>/dev/null || true; echo "$RETRY_CMD") | crontab - 2>/dev/null; then
+            pass "Cron retry job added: every 2 hours"
+            RETRY_CRON_OK=true
+        else
+            warn "Crontab retry add failed — add manually:"
+            detail "crontab -e"
+            detail "Add: $RETRY_CMD"
+        fi
         ;;
 
     windows)
         TASK_NAME="DocIntelScan"
-        # Try schtasks
+        RETRY_TASK="DocIntelDeliver"
+        # Try schtasks for scan
         schtasks /delete /tn "$TASK_NAME" /f 2>/dev/null || true
         if schtasks /create /tn "$TASK_NAME" /tr "$PYTHON $PIPELINE_PATH scan" /sc daily /st 06:00 /f 2>/dev/null; then
-            pass "Task Scheduler job created: $TASK_NAME (daily 06:00)"
+            pass "Task Scheduler: $TASK_NAME (daily 06:00)"
             CRON_OK=true
             record "cron" "PASS" "schtasks"
         else
@@ -716,6 +823,15 @@ PLIST
             detail "Run in elevated terminal:"
             detail "schtasks /create /tn \"$TASK_NAME\" /tr \"$PYTHON $PIPELINE_PATH scan\" /sc daily /st 06:00"
             record "cron" "WARN" "schtasks failed"
+        fi
+        # Retry job: every 2 hours
+        schtasks /delete /tn "$RETRY_TASK" /f 2>/dev/null || true
+        if schtasks /create /tn "$RETRY_TASK" /tr "$PYTHON $PIPELINE_PATH deliver" /sc hourly /mo 2 /f 2>/dev/null; then
+            pass "Task Scheduler: $RETRY_TASK (every 2hr)"
+            RETRY_CRON_OK=true
+        else
+            warn "schtasks retry failed — create manually:"
+            detail "schtasks /create /tn \"$RETRY_TASK\" /tr \"$PYTHON $PIPELINE_PATH deliver\" /sc hourly /mo 2"
         fi
         ;;
 esac
@@ -756,7 +872,7 @@ failed_phases=0
 warned_phases=0
 skipped_phases=0
 
-for phase in python pip git bash disk_space python-docx tomli root_create config pipeline_script git_init install_deps cron smoke_test; do
+for phase in python pip git bash disk_space pandoc python-docx tomli root_create config pipeline_script git_init install_deps cron smoke_test; do
     status="${CHECK_RESULTS[$phase]:-SKIP}"
     [[ "$status" == "SKIP" ]] && continue
     ((total_phases++))
@@ -793,6 +909,11 @@ if [[ "$CRON_OK" == true ]]; then
 else
     echo "Manual scan needed (cron not configured):"
     echo "  $PYTHON $PIPELINE_PATH scan"
+fi
+if [[ "$RETRY_CRON_OK" == true ]]; then
+    echo "Delivery retry runs every 2 hours (pending notifications)."
+else
+    echo "Retry not scheduled — dead-letter queue still works, retries happen on next scan."
 fi
 echo ""
 
